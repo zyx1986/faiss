@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import numpy as np
+
 d = 64                           # dimension
 nb = 100000                      # database size
 nq = 10000                       # nb of queries
@@ -16,16 +17,14 @@ xq[:, 0] += np.arange(nq) / 1000.
 
 import faiss                   # make faiss available
 index = faiss.IndexFlatL2(d)   # build the index
-print index.is_trained
+print(index.is_trained)
 index.add(xb)                  # add vectors to the index
-print index.ntotal
+print(index.ntotal)
 
 k = 4                          # we want to see 4 nearest neighbors
 D, I = index.search(xb[:5], k) # sanity check
-print I
-print D
+print(I)
+print(D)
 D, I = index.search(xq, k)     # actual search
-print I[:5]                    # neighbors of the 5 first queries
-print I[-5:]                   # neighbors of the 5 last queries
-
-
+print(I[:5])                   # neighbors of the 5 first queries
+print(I[-5:])                  # neighbors of the 5 last queries

@@ -53,6 +53,7 @@ void IndexIDMap::train (idx_t n, const float *x)
 void IndexIDMap::reset ()
 {
     index->reset ();
+    id_map.clear();
     ntotal = 0;
 }
 
@@ -74,6 +75,17 @@ void IndexIDMap::search (idx_t n, const float *x, idx_t k,
     for (idx_t i = 0; i < n * k; i++) {
         li[i] = li[i] < 0 ? li[i] : id_map[li[i]];
     }
+}
+
+
+void IndexIDMap::range_search (idx_t n, const float *x, float radius,
+                   RangeSearchResult *result) const
+{
+  index->range_search(n, x, radius, result);
+  for (idx_t i = 0; i < result->lims[result->nq]; i++) {
+      result->labels[i] = result->labels[i] < 0 ?
+        result->labels[i] : id_map[result->labels[i]];
+  }
 }
 
 namespace {
@@ -109,6 +121,7 @@ long IndexIDMap::remove_ids (const IDSelector & sel)
     }
     FAISS_ASSERT (j == index->ntotal);
     ntotal = j;
+    id_map.resize(ntotal);
     return nremove;
 }
 
@@ -410,17 +423,6 @@ void IndexShards::add (idx_t n, const float *x)
     add_with_ids (n, x, nullptr);
 }
 
- /**
-  * Cases (successive_ids, xids):
-  * - true, non-NULL       ERROR: it makes no sense to pass in ids and
-  *                        request them to be shifted
-  * - true, NULL           OK, but should be called only once (calls add()
-  *                        on sub-indexes).
-  * - false, non-NULL      OK: will call add_with_ids with passed in xids
-  *                        distributed evenly over shards
-  * - false, NULL          OK: will call add_with_ids on each sub-index,
-  *                        starting at ntotal
-  */
 
 void IndexShards::add_with_ids (idx_t n, const float * x, const long *xids)
 {

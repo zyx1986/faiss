@@ -518,10 +518,10 @@ def compute_populated_index(preproc):
     co.useFloat16CoarseQuantizer = False
     co.usePrecomputed = use_precomputed_tables
     co.indicesOptions = faiss.INDICES_CPU
-    co.verbose = 10
+    co.verbose = True
     co.reserveVecs = max_add if max_add > 0 else xb.shape[0]
     co.shard = True
-
+    assert co.shard_type in (0, 1, 2)
     vres, vdev = make_vres_vdev()
     gpu_index = faiss.index_cpu_to_gpu_multiple(
         vres, vdev, indexall, co)
@@ -552,7 +552,10 @@ def compute_populated_index(preproc):
     t0 = time.time()
 
     for i in range(ngpu):
-        index_src = faiss.index_gpu_to_cpu(gpu_index.at(i))
+        if ngpu == 1:
+            index_src = faiss.index_gpu_to_cpu(gpu_index)
+        else:
+            index_src = faiss.index_gpu_to_cpu(gpu_index.at(i))
         print "  index %d size %d" % (i, index_src.ntotal)
         index_src.copy_subset_to(indexall, 0, 0, nb)
 
@@ -629,8 +632,8 @@ def get_populated_index(preproc):
     co.useFloat16CoarseQuantizer = False
     co.usePrecomputed = use_precomputed_tables
     co.indicesOptions = 0
-    co.verbose = 10
-    co.shard = True # the replicas will be made "manually"
+    co.verbose = True
+    co.shard = True    # the replicas will be made "manually"
     t0 = time.time()
     print "CPU index contains %d vectors, move to GPU" % indexall.ntotal
     if replicas == 1:

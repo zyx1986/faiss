@@ -21,8 +21,10 @@
 #include "IndexPQ.h"
 #include "IndexIVF.h"
 #include "IndexIVFPQ.h"
+#include "IndexIVFFlat.h"
 #include "MetaIndexes.h"
 #include "IndexScalarQuantizer.h"
+#include "IndexHNSW.h"
 
 
 namespace faiss {
@@ -77,10 +79,10 @@ IntersectionCriterion::IntersectionCriterion (idx_t nq, idx_t R):
 
 double IntersectionCriterion::evaluate(const float* /*D*/, const idx_t* I)
     const {
-  FAISS_THROW_IF_NOT_MSG(
+    FAISS_THROW_IF_NOT_MSG(
       (gt_I.size() == gt_nnn * nq && gt_nnn >= R && nnn >= R),
       "ground truth not initialized");
-  long n_ok = 0;
+    long n_ok = 0;
 #pragma omp parallel for reduction(+: n_ok)
     for (idx_t q = 0; q < nq; q++) {
         n_ok += ranklist_intersection_size (
@@ -321,6 +323,11 @@ static void init_pq_ParameterRange (const ProductQuantizer & pq,
 
 ParameterRange &ParameterSpace::add_range(const char * name)
 {
+    for (auto & pr : parameter_ranges) {
+        if (pr.name == name) {
+            return pr;
+        }
+    }
     parameter_ranges.push_back (ParameterRange ());
     parameter_ranges.back ().name = name;
     return parameter_ranges.back ();
@@ -345,11 +352,19 @@ void ParameterSpace::initialize (const Index * index)
     }
 
     if (DC (IndexIVF)) {
-        ParameterRange & pr = add_range("nprobe");
-        for (int i = 0; i < 13; i++) {
-            size_t nprobe = 1 << i;
-            if (nprobe >= ix->nlist) break;
-            pr.values.push_back (nprobe);
+        {
+            ParameterRange & pr = add_range("nprobe");
+            for (int i = 0; i < 13; i++) {
+                size_t nprobe = 1 << i;
+                if (nprobe >= ix->nlist) break;
+                pr.values.push_back (nprobe);
+            }
+        }
+        if (dynamic_cast<const IndexHNSW*>(ix->quantizer)) {
+            ParameterRange & pr = add_range("efSearch");
+            for (int i = 2; i <= 9; i++) {
+                pr.values.push_back (1 << i);
+            }
         }
     }
     if (DC (IndexPQ)) {
@@ -359,7 +374,9 @@ void ParameterSpace::initialize (const Index * index)
     if (DC (IndexIVFPQ)) {
         ParameterRange & pr = add_range("ht");
         init_pq_ParameterRange (ix->pq, pr);
+    }
 
+    if (DC (IndexIVF)) {
         const MultiIndexQuantizer *miq =
             dynamic_cast<const MultiIndexQuantizer *> (ix->quantizer);
         if (miq) {
@@ -371,9 +388,14 @@ void ParameterSpace::initialize (const Index * index)
         }
     }
     if (DC (IndexIVFPQR)) {
-        assert (ix);
         ParameterRange & pr = add_range("k_factor");
         for (int i = 0; i <= 6; i++) {
+            pr.values.push_back (1 << i);
+        }
+    }
+    if (dynamic_cast<const IndexHNSW*>(index)) {
+        ParameterRange & pr = add_range("efSearch");
+        for (int i = 2; i <= 9; i++) {
             pr.values.push_back (1 << i);
         }
     }
@@ -427,31 +449,42 @@ void ParameterSpace::set_index_parameter (
 
     if (name == "verbose") {
         index->verbose = int(val);
+        // and fall through to also enable it on sub-indexes
     }
     if (DC (IndexPreTransform)) {
-        index = ix->index;
+        set_index_parameter (ix->index, name, val);
+        return;
     }
-    if (name == "verbose") {
-        index->verbose = int(val);
+    if (DC (IndexShards)) {
+        // call on all sub-indexes
+        for (auto & shard_index : ix->shard_indexes) {
+            set_index_parameter (shard_index, name, val);
+        }
+        return;
     }
     if (DC (IndexRefineFlat)) {
         if (name == "k_factor_rf") {
             ix->k_factor = int(val);
             return;
         }
-        index = ix->base_index;
+        // otherwise it is for the sub-index
+        set_index_parameter (&ix->refine_index, name, val);
+        return;
     }
-    if (DC (IndexPreTransform)) {
-        index = ix->index;
-    }
+
     if (name == "verbose") {
         index->verbose = int(val);
         return; // last verbose that we could find
     }
+
     if (name == "nprobe") {
-        DC(IndexIVF);
-        ix->nprobe = int(val);
-    } else if (name == "ht") {
+        if ( DC(IndexIVF)) {
+            ix->nprobe = int(val);
+            return;
+        }
+    }
+
+    if (name == "ht") {
         if (DC (IndexPQ)) {
             if (val >= ix->pq.code_size * 8) {
                 ix->search_type = IndexPQ::ST_PQ;
@@ -459,25 +492,32 @@ void ParameterSpace::set_index_parameter (
                 ix->search_type = IndexPQ::ST_polysemous;
                 ix->polysemous_ht = int(val);
             }
+            return;
         } else if (DC (IndexIVFPQ)) {
             if (val >= ix->pq.code_size * 8) {
                 ix->polysemous_ht = 0;
             } else {
                 ix->polysemous_ht = int(val);
             }
+            return;
         }
-    } else if (name == "k_factor") {
-        DC (IndexIVFPQR);
-        ix->k_factor = val;
-    } else if (name == "max_codes") {
-        DC (IndexIVFPQ);
-        ix->max_codes = finite(val) ? size_t(val) : 0;
-    } else {
-        FAISS_THROW_FMT (
-                "ParameterSpace::set_index_parameter:"
-                "could not set parameter %s",
-                name.c_str());
     }
+
+    if (name == "k_factor") {
+        if (DC (IndexIVFPQR)) {
+            ix->k_factor = val;
+            return;
+        }
+    }
+    if (name == "max_codes") {
+        if (DC (IndexIVF)) {
+            ix->max_codes = finite(val) ? size_t(val) : 0;
+            return;
+        }
+    }
+    FAISS_THROW_FMT ("ParameterSpace::set_index_parameter:"
+                     "could not set parameter %s",
+                     name.c_str());
 }
 
 void ParameterSpace::display () const
@@ -634,6 +674,15 @@ struct VTChain {
     }
 };
 
+
+/// what kind of training does this coarse quantizer require?
+char get_trains_alone(const Index *coarse_quantizer) {
+    return
+        dynamic_cast<const MultiIndexQuantizer*>(coarse_quantizer) ? 1 :
+        0;
+}
+
+
 }
 
 Index *index_factory (int d, const char *description_in, MetricType metric)
@@ -655,7 +704,7 @@ Index *index_factory (int d, const char *description_in, MetricType metric)
     for (char *tok = strtok_r (description, " ,", &ptr);
          tok;
          tok = strtok_r (nullptr, " ,", &ptr)) {
-        int d_out, opq_M, nbit, M, M2;
+        int d_out, opq_M, nbit, M, M2, pq_m, ncent;
         std::string stok(tok);
 
         // to avoid mem leaks with exceptions:
@@ -685,8 +734,11 @@ Index *index_factory (int d, const char *description_in, MetricType metric)
             vt_1 = new OPQMatrix (d, opq_M);
         } else if (stok == "L2norm") {
             vt_1 = new NormalizationTransform (d, 2.0);
-
         // coarse quantizers
+        } else if (!coarse_quantizer &&
+                   sscanf (tok, "IVF%d_HNSW%d", &ncentroids, &M) == 2) {
+            FAISS_THROW_IF_NOT (metric == METRIC_L2);
+            coarse_quantizer_1 = new IndexHNSWFlat (d, M);
         } else if (!coarse_quantizer &&
                    sscanf (tok, "IVF%d", &ncentroids) == 1) {
             if (metric == METRIC_L2) {
@@ -709,8 +761,7 @@ Index *index_factory (int d, const char *description_in, MetricType metric)
                 IndexIVF *index_ivf = new IndexIVFFlat (
                     coarse_quantizer, d, ncentroids, metric);
                 index_ivf->quantizer_trains_alone =
-                    dynamic_cast<MultiIndexQuantizer*>(coarse_quantizer)
-                    != nullptr;
+                    get_trains_alone (coarse_quantizer);
                 index_ivf->cp.spherical = metric == METRIC_INNER_PRODUCT;
                 del_coarse_quantizer.release ();
                 index_ivf->own_fields = true;
@@ -728,8 +779,7 @@ Index *index_factory (int d, const char *description_in, MetricType metric)
                     new IndexIVFScalarQuantizer (
                       coarse_quantizer, d, ncentroids, qt, metric);
                 index_ivf->quantizer_trains_alone =
-                    dynamic_cast<MultiIndexQuantizer*>(coarse_quantizer)
-                    != nullptr;
+                    get_trains_alone (coarse_quantizer);
                 del_coarse_quantizer.release ();
                 index_ivf->own_fields = true;
                 index_1 = index_ivf;
@@ -744,29 +794,55 @@ Index *index_factory (int d, const char *description_in, MetricType metric)
             IndexIVFPQR *index_ivf = new IndexIVFPQR (
                   coarse_quantizer, d, ncentroids, M, 8, M2, 8);
             index_ivf->quantizer_trains_alone =
-                dynamic_cast<MultiIndexQuantizer*>(coarse_quantizer)
-                != nullptr;
+                    get_trains_alone (coarse_quantizer);
             del_coarse_quantizer.release ();
             index_ivf->own_fields = true;
             index_1 = index_ivf;
-        } else if (!index && sscanf (tok, "PQ%d", &M) == 1) {
+        } else if (!index && (sscanf (tok, "PQ%d", &M) == 1 ||
+                              sscanf (tok, "PQ%dnp", &M) == 1)) {
+            bool do_polysemous_training = stok.find("np") == std::string::npos;
             if (coarse_quantizer) {
                 IndexIVFPQ *index_ivf = new IndexIVFPQ (
                     coarse_quantizer, d, ncentroids, M, 8);
                 index_ivf->quantizer_trains_alone =
-                    dynamic_cast<MultiIndexQuantizer*>(coarse_quantizer)
-                    != nullptr;
+                    get_trains_alone (coarse_quantizer);
                 index_ivf->metric_type = metric;
                 index_ivf->cp.spherical = metric == METRIC_INNER_PRODUCT;
                 del_coarse_quantizer.release ();
                 index_ivf->own_fields = true;
-                index_ivf->do_polysemous_training = true;
+                index_ivf->do_polysemous_training = do_polysemous_training;
                 index_1 = index_ivf;
             } else {
                 IndexPQ *index_pq = new IndexPQ (d, M, 8, metric);
-                index_pq->do_polysemous_training = true;
+                index_pq->do_polysemous_training = do_polysemous_training;
                 index_1 = index_pq;
             }
+        } else if (!index &&
+                   sscanf (tok, "HNSW%d_%d+PQ%d", &M, &ncent, &pq_m) == 3) {
+            Index * quant = new IndexFlatL2 (d);
+            IndexHNSW2Level * hidx2l = new IndexHNSW2Level (quant, ncent, pq_m, M);
+            Index2Layer * idx2l = dynamic_cast<Index2Layer*>(hidx2l->storage);
+            idx2l->q1.own_fields = true;
+            index_1 = hidx2l;
+        } else if (!index &&
+                   sscanf (tok, "HNSW%d_2x%d+PQ%d", &M, &nbit, &pq_m) == 3) {
+            Index * quant = new MultiIndexQuantizer (d, 2, nbit);
+            IndexHNSW2Level * hidx2l =
+                new IndexHNSW2Level (quant, 1 << (2 * nbit), pq_m, M);
+            Index2Layer * idx2l = dynamic_cast<Index2Layer*>(hidx2l->storage);
+            idx2l->q1.own_fields = true;
+            idx2l->q1.quantizer_trains_alone = 1;
+            index_1 = hidx2l;
+        } else if (!index &&
+                   sscanf (tok, "HNSW%d_PQ%d", &M, &pq_m) == 2) {
+            index_1 = new IndexHNSWPQ (d, pq_m, M);
+        } else if (!index &&
+                   sscanf (tok, "HNSW%d", &M) == 1) {
+            index_1 = new IndexHNSWFlat (d, M);
+        } else if (!index &&
+                   sscanf (tok, "HNSW%d_SQ%d", &M, &pq_m) == 2 &&
+                   pq_m == 8) {
+            index_1 = new IndexHNSWSQ (d, ScalarQuantizer::QT_8bit, M);
         } else if (stok == "RFlat") {
             make_IndexRefineFlat = true;
         } else {
@@ -814,7 +890,7 @@ Index *index_factory (int d, const char *description_in, MetricType metric)
         index_pt->own_fields = true;
         // add from back
         while (vts.chain.size() > 0) {
-            index_pt->prepend_transform (vts.chain.back());
+            index_pt->prepend_transform (vts.chain.back ());
             vts.chain.pop_back ();
         }
         index = index_pt;
